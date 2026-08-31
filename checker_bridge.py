@@ -44,7 +44,7 @@ _DEAD_INDICATORS = (
     'failed to tokenize card', 'failed to get proposal data',
     'submit rejected', 'handle error', 'http 404',
     'delivery_delivery_line_detail_changed', 'delivery_address2_required',
-    'url rejected', 'malformed input', 'amount_too_small', 'amount_too_small', 'amount too small',
+    'url rejected', 'malformed input', 'amount_too_small', 'amount too small',
     'site dead', 'captcha_required', 'captcha required', 'site errors',
     'all products sold out', 'no_session_token', 'tokenize_fail',
     'proxy dead', 'proxy burned', 'change your proxy', 'proxy error',
@@ -102,7 +102,7 @@ def _proxy_data_to_proxy_str(proxy_data: dict | None) -> str | None:
                 host, port = hostport.rsplit(":", 1)
                 if ":" in auth:
                     user, pw = auth.split(":", 1)
-                    user = _urlunquote _urlunquote(user)
+                    user = _urlunquote(user)
                     pw = _urlunquote(pw)
                     return f"{host}:{port}:{user}:{pw}"
                 return f"{host}:{port}"
