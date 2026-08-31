@@ -1,5 +1,6 @@
 """
-checker_bridge.py — Single-node Shopify checker API with 5× retry on error.
+checker_bridge.py — Single-node Shopify checker API with auto-detect retry.
+Logic: Only known card gateway responses pass through. Everything else retries.
 """
 
 import asyncio
@@ -22,46 +23,25 @@ MAX_RETRIES = 5
 REQUEST_TIMEOUT = 120
 _CONNECT_TIMEOUT = 5
 
-# ── ONLY these responses trigger a retry (site/connection errors) ───────────
-# Card results (declined, cvv wrong, expired, 3ds, etc.) are NOT here.
-_RETRY_INDICATORS = (
-    # Shopify site / checkout business errors
-    'amount_too_small', 'amount too small',
-    'tax_new_tax_must_be_accepted',
-    'decision_rule_block',
-    'delivery_address2_required',
-    'delivery_delivery_line_detail_changed',
-    'merchandise_out_of_stock', 'all products sold out',
-    'validation_custom',
-    'site requires login', 'requires login',
-    'order subtotal is less than',
-    'handle is empty', 'product id is empty',
-    'receipt id is empty', 'tax amount is empty',
-    'payment method identifier is empty',
-    'failed to detect product', 'failed to create checkout',
-    'failed to tokenize card', 'failed to get proposal data',
-    'submit rejected', 'handle error',
-    'url rejected', 'malformed input',
-    'site dead', 'captcha_required', 'captcha required', 'site errors',
-    'no_session_token', 'tokenize_fail',
-    'access denied',
-    'empty reply from server',
-    'page_fetch_failed', 'page_error',
-
-    # HTTP / network / proxy errors
-    'invalid url', 'error in 1st req', 'error in 1 req',
-    'cloudflare', 'connection failed', 'timed out',
-    'tlsv1 alert', 'ssl routines',
-    'could not resolve', 'domain name not found',
-    'name or service not known', 'openssl ssl_connect',
-    'httperror504', 'http error',
-    'timeout', 'unreachable', 'ssl error',
-    '502', '503', '504', 'bad gateway', 'service unavailable',
-    'gateway timeout', 'network error', 'connection reset',
-    'http 404', 'http 429', 'http 403',
-    'proxy dead', 'proxy burned', 'change your proxy', 'proxy error',
-    'authentication failed', 'could not connect', 'all nodes failed',
-    'unknown error',
+# ── WHITELIST: Yehi responses "sahi" hain → NO retry, directly show ─────────
+# Agar response mein INMEIN SE KOI BHI word mile, samjho card result aaya hai.
+# Baaki sab (site errors, connection errors, unknown errors) → AUTO retry.
+_GOOD_RESPONSES = (
+    # Charged / Success
+    'order_placed', 'order completed', 'charged', 'approved', 'live',
+    # CVV matched / Insufficient funds = LIVE card
+    'insufficient_funds', 'insufficient funds',
+    'incorrect_cvc', 'invalid_cvc', 'incorrect_cvv', 'invalid_cvv',
+    'incorrect_zip',
+    # Declined = definitive gateway result (NOT an error)
+    'card_declined', 'do_not_honor', 'declined',
+    # Other definitive card states
+    'expired_card', 'expired',
+    'pick_up_card', 'stolen_card',
+    'fraudulent', 'fraud_suspected', 'fraud',
+    '3ds', 'otp_required', 'authentication_required',
+    'risky', 'ccn', 'live_limit',
+    'cvv', 'ccv', 'zip',
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -174,12 +154,15 @@ def _map_result(raw: dict, cc_str: str, site_url: str) -> dict:
     return result
 
 
-def _should_retry(response_text: str) -> bool:
-    """Return True only for site/connection errors — NOT for card results."""
-    if not response_text:
-        return True
+def _is_good_response(response_text: str) -> bool:
+    """
+    Auto-detect: True = proper card result (no retry needed).
+    False = site error / connection error / unknown → retry.
+    """
+    if not response_text or response_text.strip().lower() == "unknown":
+        return False
     rl = response_text.lower()
-    return any(ind in rl for ind in _RETRY_INDICATORS)
+    return any(good in rl for good in _GOOD_RESPONSES)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -220,8 +203,8 @@ async def _call_api(cc_str: str, proxy_str: str) -> dict:
 async def check_card_site(cc_str: str, site_url: str, proxy_data: dict | None) -> dict:
     """
     Main entry point (same signature as before so bot.py needs ZERO changes).
-    site_url is ignored — new API does not need it.
-    Retries up to MAX_RETRIES times on site/connection errors only.
+    Auto-detect logic: proper card result = show immediately.
+    Any site/connection/unknown error = retry up to MAX_RETRIES.
     """
     proxy_str = _proxy_data_to_proxy_str(proxy_data)
     if not proxy_str:
@@ -249,29 +232,29 @@ async def check_card_site(cc_str: str, site_url: str, proxy_data: dict | None) -
                 f" | status={result.get('Status')} | resp={response_text[:60]}"
             )
 
-            # ✅ Agar response card result hai (declined, live, cvv, etc.) → return immediately
-            if not _should_retry(response_text):
+            # ✅ AUTO-DETECT: Agar proper card result hai → return immediately
+            if _is_good_response(response_text):
                 return result
 
-            # ⚠️ Site/connection error → retry karo (agar attempt bachi ho)
+            # ⚠️ Error / Site issue / Unknown → retry karo
             last_result = result
-            last_err = f"Retry-worthy response: {response_text[:80]}"
-            log.warning(f"[bridge] retry-trigger response on attempt {attempt}, retrying...")
+            last_err = f"Not a card result: {response_text[:80]}"
+            log.warning(f"[bridge] auto-detect: retrying attempt {attempt}...")
 
             if attempt < MAX_RETRIES:
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(1.0)
 
         except Exception as e:
             last_err = f"{type(e).__name__}: {str(e)[:80]}"
-            log.warning(f"[bridge] attempt {attempt}/{MAX_RETRIES} failed — {last_err}")
+            log.warning(f"[bridge] attempt {attempt}/{MAX_RETRIES} exception — {last_err}")
             if attempt < MAX_RETRIES:
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(1.0)
             else:
                 break
 
-    # Sab retries khatam — last response return karo (agar mila ho) warna error
+    # Sab retries khatam
     if last_result is not None:
-        log.warning(f"[bridge] all {MAX_RETRIES} retries exhausted, returning last response")
+        log.warning(f"[bridge] all {MAX_RETRIES} retries done, returning last response")
         return last_result
 
     return {
@@ -292,7 +275,7 @@ async def test_site(
     status = "working"
     if "proxy dead" in response_text.lower():
         status = "proxy_dead"
-    elif _should_retry(response_text):
+    elif not _is_good_response(response_text):
         status = "dead"
     return {"status": status, "response": response_text, "site": site_url, "price": price}
 
