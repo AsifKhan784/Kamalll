@@ -19,7 +19,7 @@ log.setLevel(logging.DEBUG)
 # ══════════════════════════════════════════════════════════════════════════════
 
 API_BASE = "http://5.175.222.144:8081"
-MAX_RETRIES = 2          # 5 → 2 (bot.py already handles higher-level retry)
+MAX_RETRIES = 4          # Retry up to 4 proxies before giving up
 REQUEST_TIMEOUT = 60     # 120 → 60
 _CONNECT_TIMEOUT = 5
 RETRY_DELAY = 0.5        # 1.0 → 0.5
@@ -63,7 +63,7 @@ _NO_RETRY_RESPONSES = (
     'no valid payment method found',
     'site error (http 429)',         # Rate limit — same proxy se retry bekaar
     'site error (http 404)',         # Dead site
-    'unable to get payment token: 403',  # Proxy/site blocked
+    # 'unable to get payment token: 403',  # REMOVED → now retries with next proxy
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -174,7 +174,18 @@ def _map_result(raw: dict, cc_str: str, site_url: str) -> dict:
     }
     p = str(result["Price"])
     if p not in ("-", "", "0.00") and not p.startswith("$"):
-        result["Price"] = f"${p}"
+        # Clean float artifacts: 1.660000000000001 CAD → $1.66 CAD
+        import re
+        m = re.match(r"^(\d+(?:\.\d+)?)(.*)$", p.strip())
+        if m:
+            try:
+                num = float(m.group(1))
+                suffix = m.group(2).strip()
+                result["Price"] = f"${num:.2f}" + (f" {suffix}" if suffix else "")
+            except ValueError:
+                result["Price"] = f"${p}"
+        else:
+            result["Price"] = f"${p}"
     return result
 
 
